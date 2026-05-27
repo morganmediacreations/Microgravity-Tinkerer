@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Orbital Forge v0.2 - Smash Mechanic</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; }
+    #hud {
+      position: absolute; top: 10px; width: 100%; text-align: center;
+      color: #00ffff; font-family: monospace; font-size: 18px; text-shadow: 0 0 5px #00ffff;
+      pointer-events: none; z-index: 100;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Forged: <span id="score">0</span> | Grip to grab | Smash asteroids together!</div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+        "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { VRButton } from 'three/addons/webxr/VRButton.js';
+    import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+    import * as CANNON from 'cannon-es';
+
+    let score = 0;
+    const scoreEl = document.getElementById('score');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000008);
+    scene.fog = new THREE.Fog(0x000008, 10, 50);
+
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1)); // Quest perf
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(VRButton.createButton(renderer));
+
+    // Lighting
+    scene.add(new THREE.AmbientLight(0x222244, 0.5));
+    const light = new THREE.DirectionalLight(0xffffff, 1.2);
+    light.position.set(5, 10, 5);
+    scene.add(light);
+
+    // Physics - zero G space
+    const world = new CANNON.World({ gravity: new CANNON.Vec3(0, 0, 0) });
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.defaultContactMaterial.restitution = 0.6; // Bouncy
+
+    // Player rig - move this, not the camera
+    const player = new THREE.Group();
+    player.position.set(0, 0, 3);
+    scene.add(player);
+    player.add(camera);
+
+    // Controllers with rays
+    const controllerModelFactory = new XRControllerModelFactory();
+    const controllers = [];
+    const grabConstraints = new Map(); // controller -> constraint
+
+    for (let i = 0; i < 2; i++) {
+      const controller = renderer.xr.getController(i);
+      const grip = renderer.xr.getControllerGrip(i);
+      grip.add(controllerModelFactory.createControllerModel(grip));
+      player.add(grip);
+      player.add(controller);
+
+      // Laser pointer
+      const lineGeom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+      const line = new THREE.Line(lineGeom, new THREE.LineBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.5 }));
+      line.scale.z = 3;
+      controller.add(line);
+      controller.userData.line = line;
+
+      controllers.push(controller);
+    }
+
+    // Object management
+    const asteroids = [];
+    const metalChunks = [];
+    const asteroidMat = new THREE.MeshStandardMaterial({ color: 0x666666, roughness: 0.9, metalness: 0.1 });
+    const metalMat = new THREE.MeshStandardMaterial({
+      color: 0xff8800, emissive: 0xff4400, emissiveIntensity: 0.5,
+      roughness: 0.2, metalness: 0.9
+    });
+
+    function spawnAsteroid(pos) {
+      const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(0.15, 1), asteroidMat);
+      mesh.position.copy(pos || new THREE.Vector3(
+        (Math.random() - 0.5) * 4,
+        (Math.random() - 0.5) * 2 + 1.2,
+        -2 - Math.random() * 2
+      ));
+      mesh.userData.type = 'asteroid';
+      scene.add(mesh);
+
+      const body = new CANNON.Body({
+        mass: 0.4,
+        shape: new CANNON.Sphere(0.15),
+        position: new CANNON.Vec3().copy(mesh.position),
+        linearDamping: 0.1,
+        angularDamping: 0.1
+      });
+      body.userData = { mesh, type: 'asteroid' };
+      world.addBody(body);
+      mesh.userData.body = body;
+      asteroids.push(mesh);
+
+      // Collision detection for forging
+      body.addEventListener('collide', (e) => handleCollision(e, body));
+      return { mesh, body };
+    }
+
+    function spawnMetalChunk(pos) {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.2), metalMat);
+      mesh.position.copy(pos);
+      mesh.userData.type = 'metal';
+      scene.add(mesh);
+
+      const body = new CANNON.Body({
+        mass: 0.8,
+        shape: new CANNON.Box(new CANNON.Vec3(0.1, 0.1, 0.1)),
+        position: new CANNON.Vec3().copy(pos),
+        linearDamping: 0.15,
+        angularDamping: 0.15
+      });
+      body.userData = { mesh, type: 'metal' };
+      world.addBody(body);
+      mesh.userData.body = body;
+      metalChunks.push(mesh);
+
+      // Particle burst
+      spawnParticles(pos);
+
+      score++;
+      scoreEl.textContent = score;
+      return { mesh, body };
+    }
+
+    function spawnParticles(pos) {
+      const particleGeo = new THREE.BufferGeometry();
+      const positions = [];
+      for (let i = 0; i < 20; i++) {
+        positions.push(
+          pos.x + (Math.random() - 0.5) * 0.5,
+          pos.y + (Math.random() - 0.5) * 0.5,
+          pos.z + (Math.random() - 0.5) * 0.5
+        );
+      }
+      particleGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      const particleMat = new THREE.PointsMaterial({ color: 0xffaa00, size: 0.05, transparent: true });
+      const particles = new THREE.Points(particleGeo, particleMat);
+      scene.add(particles);
+      setTimeout(() => scene.remove(particles), 1000);
+    }
+
+    // FORGE MECHANIC: Smash asteroids together
+    function handleCollision(event, bodyA) {
+      const bodyB = event.body;
+      if (!bodyA.userData ||!bodyB.userData) return;
+      if (bodyA.userData.type!== 'asteroid' || bodyB.userData.type!== 'asteroid') return;
+
+      const relativeVelocity = event.contact.getImpactVelocityAlongNormal();
+      if (Math.abs(relativeVelocity) > 2.0) { // Threshold: smash hard enough
+        const pos = new CANNON.Vec3();
+        bodyA.position.vadd(bodyB.position, pos);
+        pos.scale(0.5, pos); // Midpoint
+
+        // Remove both asteroids
+        world.removeBody(bodyA);
+        world.removeBody(bodyB);
+        scene.remove(bodyA.userData.mesh);
+        scene.remove(bodyB.userData.mesh);
+        asteroids.splice(asteroids.indexOf(bodyA.userData.mesh), 1);
+        asteroids.splice(asteroids.indexOf(bodyB.userData.mesh), 1);
+
+        // Spawn metal chunk
+        spawnMetalChunk(pos);
+
+        // Spawn 2 new asteroids so game doesn't run out
+        setTimeout(() => spawnAsteroid(), 2000);
+        setTimeout(() => spawnAsteroid(), 3000);
+      }
+    }
+
+    // Initial asteroids
+    for (let i = 0; i < 8; i++) spawnAsteroid();
+
+    // GRAB SYSTEM - Fixed to allow multiple grabs using constraints
+    const raycaster = new THREE.Raycaster();
+    const tempMatrix = new THREE.Matrix4();
+
+    function onSqueezeStart(event) {
+      const controller = event.target;
+      if (grabConstraints.has(controller)) return; // Already holding
+
+      tempMatrix.identity().extractRotation(controller.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+
+      const grabbables = [...asteroids,...metalChunks];
+      const intersects = raycaster.intersectObjects(grabbables);
+
+      if (intersects.length > 0 && intersects[0].distance < 2.0) {
+        const mesh = intersects[0].object;
+        const body = mesh.userData.body;
+
+        // Use constraint instead of reparenting - this fixes the "one throw" bug
+        const constraint = new CANNON.LockConstraint(body, new CANNON.Body({ mass: 0 }));
+        constraint.collideConnected = false;
+
+        // Create a kinematic body at controller position
+        const grabBody = new CANNON.Body({ mass: 0, type: CANNON.Body.KINEMATIC });
+        grabBody.position.setFromMatrixPosition(controller.matrixWorld);
+        world.addBody(grabBody);
+
+        const lockConstraint = new CANNON.LockConstraint(body, grabBody);
+        world.addConstraint(lockConstraint);
+
+        grabConstraints.set(controller, { constraint: lockConstraint, body, grabBody, mesh });
+        controller.userData.line.material.color.setHex(0x00ff00); // Green when grabbing
+
+        if (controller.gamepad?.hapticActuators) {
+          controller.gamepad.hapticActuators[0].pulse(1.0, 100);
+        }
+      }
+    }
+
+    function onSqueezeEnd(event) {
+      const controller = event.target;
+      const grabData = grabConstraints.get(controller);
+      if (!grabData) return;
+
+      world.removeConstraint(grabData.constraint);
+      world.removeBody(grabData.grabBody);
+
+      // Apply throw velocity from controller movement
+      const velocity = new THREE.Vector3();
+      controller.getWorldPosition(velocity);
+      // Simple velocity: use forward direction of controller
+      controller.getWorldDirection(velocity);
+      grabData.body.velocity.set(-velocity.x * 5, -velocity.y * 5, -velocity.z * 5);
+
+      grabConstraints.delete(controller);
+      controller.userData.line.material.color.setHex(0x00ffff);
+    }
+
+    controllers.forEach(c => {
+      c.addEventListener('squeezestart', onSqueezeStart);
+      c.addEventListener('squeezeend', onSqueezeEnd);
+    });
+
+    // LOCOMOTION - Full 6DOF using left stick, snap turn right stick
+    const moveVec = new THREE.Vector3();
+    let snapCooldown = 0;
+
+    function handleMovement(dt) {
+      const session = renderer.xr.getSession();
+      if (!session) return;
+
+      for (const source of session.inputSources) {
+        if (!source.gamepad) continue;
+
+        // Left stick: 6DOF movement relative to headset direction
+        if (source.handedness === 'left') {
+          const x = source.gamepad.axes[2] || 0;
+          const y = source.gamepad.axes[3] || 0;
+
+          if (Math.abs(x) > 0.1 || Math.abs(y) > 0.1) {
+            moveVec.set(x, 0, y); // x=strafe, z=forward/back
+            moveVec.applyQuaternion(camera.quaternion); // Move relative to where you look
+            moveVec.y = y * -1; // Up/down on stick Y
+            player.position.addScaledVector(moveVec, 2.5 * dt);
+          }
+        }
+
+        // Right stick: snap turn
+        if (source.handedness === 'right' && snapCooldown <= 0) {
+          const x = source.gamepad.axes[2] || 0;
+          if (Math.abs(x) > 0.8) {
+            player.rotation.y -= Math.sign(x) * Math.PI / 4; // 45deg
+            snapCooldown = 0.3;
+          }
+        }
+      }
+      if (snapCooldown > 0) snapCooldown -= dt;
+
+      // Update grab constraints to follow controllers
+      grabConstraints.forEach((data, controller) => {
+        data.grabBody.position.setFromMatrixPosition(controller.matrixWorld);
+        data.grabBody.quaternion.setFromRotationMatrix(controller.matrixWorld);
+      });
+    }
+
+    // Game loop
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => {
+      const dt = clock.getDelta();
+      world.step(1/72, dt, 3); // 3 substeps for stability
+
+      // Sync physics to graphics
+      [...asteroids,...metalChunks].forEach(mesh => {
+        mesh.position.copy(mesh.userData.body.position);
+        mesh.quaternion.copy(mesh.userData.body.quaternion);
+      });
+
+      handleMovement(dt);
+      renderer.render(scene, camera);
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
