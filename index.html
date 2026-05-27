@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Microgravity Tinkerer - Chunk 2.3 Fixed Grab</title>
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+        #renderCanvas { width: 100%; height: 100%; touch-action: none; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; color: #fff; z-index: 10;
+            background: rgba(0,0,0,0.6); padding: 16px; border-radius: 8px; font-family: sans-serif;
+        }
+        #vrButton {
+            position: absolute; bottom: 20px; right: 20px; padding: 12px 24px;
+            font-size: 16px; background: #5865F2; color: white; border: none;
+            border-radius: 8px; cursor: pointer; z-index: 10;
+        }
+        #comfort { position: absolute; bottom: 20px; left: 20px; z-index: 10; }
+        #comfort button {
+            display: block; margin: 8px 0; padding: 8px 16px;
+            background: rgba(255,255,255,0.1); color: white;
+            border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; cursor: pointer;
+        }
+    </style>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <script src="https://cdn.babylonjs.com/havok/HavokPhysics_umd.js"></script>
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+    <div id="ui">
+        <h1>Microgravity Tinkerer</h1>
+        <p>Chunk 2.3: Parent Grab - Should Not Freeze</p>
+        <p>Grab = trigger/pinch. Release = toss with controller velocity.</p>
+    </div>
+    <button id="vrButton" disabled>Checking VR...</button>
+    <div id="comfort">
+        <button id="snapTurn">Snap Turn: 30°</button>
+        <button id="vignette">Vignette: OFF</button>
+    </div>
+
+    <script>
+        const canvas = document.getElementById("renderCanvas");
+        const engine = new BABYLON.Engine(canvas, true, { stencil: false });
+
+        const createScene = async function () {
+            const scene = new BABYLON.Scene(engine);
+            scene.clearColor = new BABYLON.Color4(0.01, 0.01, 0.05, 1);
+
+            // Spawn in front of bench
+            const camera = new BABYLON.FreeCamera("camera", new BABYLON.Vector3(0, 1.6, 0.6), scene);
+            camera.minZ = 0.1;
+            camera.setTarget(new BABYLON.Vector3(0, 1.0, 0));
+
+            const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+            light.intensity = 1.5;
+            const dirLight = new BABYLON.DirectionalLight("dir", new BABYLON.Vector3(-0.5, -1, -0.5), scene);
+            dirLight.intensity = 0.6;
+
+            const skybox = BABYLON.MeshBuilder.CreateBox("skybox", { size: 100 }, scene);
+            const skyboxMat = new BABYLON.StandardMaterial("skyboxMat", scene);
+            skyboxMat.backFaceCulling = false;
+            skyboxMat.disableLighting = true;
+            skyboxMat.emissiveColor = new BABYLON.Color3(0.02, 0.02, 0.08);
+            skybox.material = skyboxMat;
+            skybox.infiniteDistance = true;
+
+            const havokInstance = await HavokPhysics();
+            const hk = new BABYLON.HavokPlugin(true, havokInstance);
+            scene.enablePhysics(new BABYLON.Vector3(0, 0, 0), hk);
+
+            // Square bench
+            const bench = BABYLON.MeshBuilder.CreateBox("bench", {
+                width: 1.0, height: 0.05, depth: 1.0
+            }, scene);
+            bench.position.y = 0.9;
+            const benchMat = new BABYLON.PBRMaterial("benchMat", scene);
+            benchMat.metallic = 0.8; benchMat.roughness = 0.4;
+            benchMat.albedoColor = new BABYLON.Color3(0.3, 0.3, 0.35);
+            bench.material = benchMat;
+            new BABYLON.PhysicsAggregate(bench, BABYLON.PhysicsShapeType.BOX, { mass: 0, friction: 0.8 }, scene);
+
+            const xr = await scene.createDefaultXRExperienceAsync({
+                floorMeshes: [bench]
+            });
+
+            xr.baseExperience.featuresManager.enableFeature(BABYLON.WebXRFeatureName.HAND_TRACKING, "latest", {
+                xrInput: xr.input,
+                jointMeshes: { enablePhysics: true }
+            });
+
+            // --- BULLETPROOF GRAB: Parent to controller, no physics during grab ---
+            const grabbedObjects = new Map(); // track which controller has which mesh
+
+            const makeGrabbable = (mesh, physicsAggregate) => {
+                mesh.isPickable = true;
+                mesh.actionManager = new BABYLON.ActionManager(scene);
+
+                // Hover highlight
+                const mat = mesh.material;
+                mesh.actionManager.registerAction(new BABYLON.ExecuteCodeAction(
+                    BABYLON.ActionManager.OnPointerOverTrigger, () => mat.emissiveColor = mat.albedoColor.scale(0.3)
+                ));
+                mesh.actionManager.registerAction(new BABYLON.ExecuteCodeAction(
+                    BABYLON.ActionManager.OnPointerOutTrigger, () => {
+                        if (!grabbedObjects.has(mesh)) mat.emissiveColor = mat.albedoColor.scale(0.05);
+                    }
+                ));
+
+                // Grab start
+                mesh.actionManager.registerAction(new BABYLON.ExecuteCodeAction(
+                    BABYLON.ActionManager.OnPickDownTrigger, (evt) => {
+                        const controller = xr.pointerSelection.getLastSelectedController();
+                        if (!controller || grabbedObjects.has(mesh)) return;
+
+                        // KEY: Disable physics and parent to controller
+                        physicsAggregate.body.setMotionType(BABYLON.PhysicsMotionType.STATIC);
+                        mesh.setParent(controller.grip || controller.pointer);
+                        grabbedObjects.set(mesh, controller);
+                        mat.emissiveColor = mat.albedoColor.scale(0.5);
+                    }
+                ));
+
+                // Grab end - use pointer up on scene to catch release anywhere
+                scene.onPointerUp = () => {
+                    if (grabbedObjects.has(mesh)) {
+                        const controller = grabbedObjects.get(mesh);
+                        mesh.setParent(null);
+                        grabbedObjects.delete(mesh);
+
+                        // KEY: Re-enable physics at world position
+                        physicsAggregate.body.setMotionType(BABYLON.PhysicsMotionType.DYNAMIC);
+
+                        // Throw: use controller velocity
+                        if (controller && controller.inputSource.gamepad) {
+                            // Babylon doesn't expose linearVelocity directly, so we estimate from pointer position delta
+                            const vel = controller.pointer.absolutePosition.subtract(controller.pointer.position).scale(20);
+                            physicsAggregate.body.applyImpulse(vel, mesh.getAbsolutePosition());
+                        }
+
+                        mat.emissiveColor = mat.albedoColor.scale(0.05);
+                    }
+                };
+            };
+
+            const createPart = (name, pos, color) => {
+                const part = BABYLON.MeshBuilder.CreateBox(name, { size: 0.08 }, scene);
+                part.position = pos;
+                const mat = new BABYLON.PBRMaterial(name + "Mat", scene);
+                mat.metallic = 0.2; mat.roughness = 0.3;
+                mat.albedoColor = color; mat.emissiveColor = color.scale(0.05);
+                part.material = mat;
+
+                const aggregate = new BABYLON.PhysicsAggregate(part, BABYLON.PhysicsShapeType.BOX, {
+                    mass: 0.3, restitution: 0.1, friction: 0.9
+                }, scene);
+                aggregate.body.setLinearDamping(0.5);
+                aggregate.body.setAngularDamping(0.9);
+
+                makeGrabbable(part, aggregate);
+                return part;
+            };
+
+            createPart("part1", new BABYLON.Vector3(0.2, 0.95, -0.2), new BABYLON.Color3(0.9, 0.3, 0.2));
+            createPart("part2", new BABYLON.Vector3(-0.2, 0.95, -0.1), new BABYLON.Color3(0.2, 0.6, 0.9));
+            createPart("part3", new BABYLON.Vector3(0, 0.95, 0.2), new BABYLON.Color3(0.3, 0.9, 0.3));
+
+            // Comfort
+            let snapTurnEnabled = true;
+            document.getElementById("snapTurn").onclick = () => {
+                snapTurnEnabled =!snapTurnEnabled;
+                document.getElementById("snapTurn").textContent = `Snap Turn: ${snapTurnEnabled? '30°' : 'OFF'}`;
+            };
+
+            xr.input.onControllerAddedObservable.add((controller) => {
+                controller.onMotionControllerInitObservable.add((motionController) => {
+                    const thumbstick = motionController.getComponent("xr-standard-thumbstick");
+                    if (thumbstick) {
+                        let canSnap = true;
+                        thumbstick.onAxisValueChangedObservable.add(() => {
+                            if (!snapTurnEnabled ||!canSnap) return;
+                            if (Math.abs(thumbstick.axes.x) > 0.8) {
+                                xr.baseExperience.camera.rotation.y += thumbstick.axes.x > 0? Math.PI/6 : -Math.PI/6;
+                                canSnap = false;
+                                setTimeout(() => canSnap = true, 300);
+                            }
+                        });
+                    }
+                });
+            });
+
+            let vignetteEnabled = false;
+            const vignettePostProcess = new BABYLON.ImageProcessingPostProcess("vignette", 1.0, camera);
+            vignettePostProcess.vignetteEnabled = false;
+            vignettePostProcess.vignetteWeight = 5.0;
+            document.getElementById("vignette").onclick = () => {
+                vignetteEnabled =!vignetteEnabled;
+                vignettePostProcess.vignetteEnabled = vignetteEnabled;
+                document.getElementById("vignette").textContent = `Vignette: ${vignetteEnabled? 'ON' : 'OFF'}`;
+            };
+
+            const vrButton = document.getElementById("vrButton");
+            const supported = await xr.baseExperience.sessionManager.isSessionSupportedAsync("immersive-vr");
+            if (supported) {
+                vrButton.disabled = false;
+                vrButton.textContent = "Enter VR";
+                vrButton.onclick = () => xr.baseExperience.enterXRAsync("immersive-vr", "local-floor");
+            }
+
+            xr.baseExperience.onStateChangedObservable.add((state) => {
+                if (state === BABYLON.WebXRState.IN_XR) {
+                    document.getElementById("ui").style.display = "none";
+                    vrButton.style.display = "none";
+                }
+            });
+
+            return scene;
+        };
+
+        createScene().then(scene => {
+            engine.runRenderLoop(() => scene.render());
+            window.addEventListener("resize", () => engine.resize());
+        });
+    </script>
+</body>
+</html>
